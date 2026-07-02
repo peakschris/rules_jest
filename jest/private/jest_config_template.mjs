@@ -202,24 +202,33 @@ export default async function jestConfig() {
       console.error("COVERAGE-DIAG error: " + ((e && e.stack) || e));
     }
 
-    // On Windows, V8 resolves symlinks before recording coverage so paths end
-    // up in bazel-out/<config>/bin/... while the default rootDir is in the
-    // runfiles tree. Point rootDir at the resolved bin directory so V8 coverage
-    // can match source files. Windows only: on Linux the same repoint routes
-    // test discovery through a node_modules symlink (testPathIgnorePatterns then
-    // drops every test -> "No tests found"), and the default rootDir already
-    // finds tests and records coverage there. Linux only needs the SF-path
-    // rewrite below.
-    let binRoot;
-    if (process.platform === "win32") {
-      try {
-        binRoot = path.dirname(
-          realpathSync(fileURLToPath(import.meta.url)),
-        );
-        config.rootDir = binRoot;
-      } catch (_) {
-        // Fall back to default rootDir if symlink resolution fails
+    // V8 records coverage URLs by realpath: Node resolves the runfiles symlink,
+    // so every URL lands under the execroot bin tree (bazel-out/<cfg>/bin/...).
+    // Jest, however, derives rootDir from the --config path Bazel passes, which
+    // is the runfiles/sandbox tree on Linux (and the bin tree on Windows).
+    // jest-runtime's coverage filter keeps a V8 entry only when
+    //   res.url.startsWith(config.rootDir)  AND  shouldInstrument(res.url,...)
+    // (the latter matches path.relative(rootDir, res.url) against
+    // collectCoverageFrom) -- BOTH fail when rootDir is the runfiles tree but the
+    // URL is the bin realpath, so all coverage is dropped and Jest emits empty
+    // reports. Repoint rootDir at the realpath'd bin directory (where the V8 URLs
+    // actually are) on every platform so both checks pass.
+    //
+    // Repointing rootDir can move it away from where Bazel staged the test files
+    // (that earlier caused "No tests found" on Linux). Keep discovery working by
+    // pointing `roots` back at the runfiles source directory Bazel populated,
+    // derived from the user config's runfiles path.
+    try {
+      config.rootDir = path.dirname(
+        realpathSync(fileURLToPath(import.meta.url)),
+      );
+      if (userConfigShortPath) {
+        config.roots = [
+          path.dirname(_resolveRunfilesPath(userConfigShortPath)),
+        ];
       }
+    } catch (_) {
+      // Fall back to default rootDir if symlink resolution fails
     }
 
     let coverageFile = path.basename(process.env.COVERAGE_OUTPUT_FILE);
