@@ -173,20 +173,24 @@ export default async function jestConfig() {
     config.collectCoverage = true;
     config.coverageProvider = "v8";
 
-    // V8 resolves module symlinks before recording coverage, so recorded paths
-    // land in bazel-out/<config>/bin/... while Jest's default rootDir is in the
+    // On Windows, V8 resolves symlinks before recording coverage so paths end
+    // up in bazel-out/<config>/bin/... while the default rootDir is in the
     // runfiles tree. Point rootDir at the resolved bin directory so V8 coverage
-    // can match source files. This applies on every platform: node resolves the
-    // symlink to the bin tree with preserve_symlinks=false (the default), so
-    // Linux needs the same rootDir fixup as Windows, not just win32.
+    // can match source files. Windows only: on Linux the same repoint routes
+    // test discovery through a node_modules symlink (testPathIgnorePatterns then
+    // drops every test -> "No tests found"), and the default rootDir already
+    // finds tests and records coverage there. Linux only needs the SF-path
+    // rewrite below.
     let binRoot;
-    try {
-      binRoot = path.dirname(
-        realpathSync(fileURLToPath(import.meta.url)),
-      );
-      config.rootDir = binRoot;
-    } catch (_) {
-      // Fall back to default rootDir if symlink resolution fails
+    if (process.platform === "win32") {
+      try {
+        binRoot = path.dirname(
+          realpathSync(fileURLToPath(import.meta.url)),
+        );
+        config.rootDir = binRoot;
+      } catch (_) {
+        // Fall back to default rootDir if symlink resolution fails
+      }
     }
 
     let coverageFile = path.basename(process.env.COVERAGE_OUTPUT_FILE);
@@ -208,14 +212,26 @@ export default async function jestConfig() {
 
       // Bazel's coverage merger expects SF paths to be workspace-relative
       // (e.g. src/cfgsvc/lib/app.js). With coverageProvider v8 the recorded
-      // paths are absolute (or relative to cwd, the runfiles dir) and resolve
-      // into the bazel-out bin tree on every platform. Rewrite them to
-      // workspace-relative short paths after Jest finishes.
-      if (binRoot && !process._jestCoverageRewriteRegistered) {
+      // paths are absolute (or relative to cwd). Depending on platform they
+      // resolve either into the bazel-out bin tree (Windows, where V8 follows
+      // the symlink) or into the runfiles tree (Linux, default rootDir).
+      // Rewrite both forms to workspace-relative short paths after Jest
+      // finishes; runs on every platform (a best-effort, exit-time file
+      // rewrite that cannot affect test execution).
+      if (!process._jestCoverageRewriteRegistered) {
         process._jestCoverageRewriteRegistered = true;
         const covFilePath = path.join(coverageDirectory, coverageFile);
         const bindir = process.env.JS_BINARY__BINDIR;
-        const binSuffix = "/" + bindir.replace(/\\/g, "/") + "/";
+        const binSuffix = bindir
+          ? "/" + bindir.replace(/\\/g, "/") + "/"
+          : null;
+        // e.g. <...>/test.runfiles/_main/ -> strip to leave src/<svc>/...
+        const runfiles = process.env.JS_BINARY__RUNFILES;
+        const workspace = process.env.JS_BINARY__WORKSPACE;
+        const runfilesRoot =
+          runfiles && workspace
+            ? runfiles.replace(/\\/g, "/").replace(/\/$/, "") + "/" + workspace + "/"
+            : null;
         process.on("exit", () => {
           try {
             if (!existsSync(covFilePath)) return;
@@ -226,9 +242,16 @@ export default async function jestConfig() {
                 ? sfPath
                 : path.resolve(cwd, sfPath);
               abs = abs.replace(/\\/g, "/");
-              const idx = abs.indexOf(binSuffix);
-              if (idx >= 0) {
-                return "SF:" + abs.slice(idx + binSuffix.length);
+              // bazel-out/<config>/bin/ tree (Windows, or Linux realpath'd).
+              if (binSuffix) {
+                const idx = abs.indexOf(binSuffix);
+                if (idx >= 0) {
+                  return "SF:" + abs.slice(idx + binSuffix.length);
+                }
+              }
+              // runfiles tree (Linux, default rootDir).
+              if (runfilesRoot && abs.startsWith(runfilesRoot)) {
+                return "SF:" + abs.slice(runfilesRoot.length);
               }
               return "SF:" + sfPath;
             });
