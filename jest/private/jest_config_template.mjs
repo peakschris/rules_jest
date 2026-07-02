@@ -104,6 +104,115 @@ function _addReporter(config, name, reporter = name) {
   if (!exists) config.reporters.push(reporter);
 }
 
+/**
+ * Minimal glob -> RegExp for `collectCoverageFrom` matching -- a small subset of
+ * micromatch (`**`, `**​/`, `*`, `?`) sufficient for the conventional coverage
+ * globs (e.g. `lib/**​/*.js`, `!lib/**​/*.test.js`). Only used by the exit-time
+ * 0%-backfill below; NOT a general micromatch replacement.
+ */
+function _globToRegExp(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        i++;
+        if (glob[i + 1] === "/") {
+          i++;
+          re += "(?:.*/)?"; // globstar segment: zero or more dirs
+        } else {
+          re += ".*"; // trailing/embedded globstar
+        }
+      } else {
+        re += "[^/]*"; // single-segment wildcard
+      }
+    } else if (c === "?") {
+      re += "[^/]";
+    } else if (c === "/") {
+      re += "/";
+    } else if ("\\^$.|+()[]{}".indexOf(c) !== -1) {
+      re += "\\" + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp("^" + re + "$");
+}
+
+/**
+ * Append synthetic 0%-coverage LCOV records for source files that match
+ * `collectCoverageFrom` but were never loaded by any test.
+ *
+ * WHY: jest's v8 coverage provider only records files actually executed, and its
+ * `_addUntestedFiles` 0%-backfill enumerates `collectCoverageFrom` relative to
+ * `rootDir` -- which the v8 fix repoints at the bin tree while the haste FS comes
+ * from the runfiles tree, so the globs never match and untested files are simply
+ * absent from the report (making overall coverage read optimistically). The
+ * runfiles/bin/haste-map split makes this irreconcilable via `rootDir` alone, so
+ * we backfill here at exit instead, independent of jest's own enumeration.
+ *
+ * Enumeration source is the Bazel filelist (`test__jest.files.json`: an array of
+ * workspace-relative data paths), filtered by the package-relative
+ * `collectCoverageFrom` globs (`JS_BINARY__PACKAGE` is stripped to make filelist
+ * entries package-relative). Line counts come from the runfiles copy of each
+ * file. Emits `DA:n,0` for every physical line + `LF`/`LH:0`, matching the shape
+ * v8/lcovonly produces for covered files (a DA entry per line). `presentPaths`
+ * (workspace-relative SF paths already in the report) are skipped. Best-effort:
+ * any failure returns the report unchanged.
+ */
+function _appendUntestedFiles(lcov, config, presentPaths) {
+  const patterns = config.collectCoverageFrom;
+  if (!Array.isArray(patterns) || patterns.length === 0) return lcov;
+  if (!bazelFilelistJsonPath || !existsSync(bazelFilelistJsonPath)) return lcov;
+
+  const pkg = process.env.JS_BINARY__PACKAGE || "";
+  const pkgPrefix = pkg ? pkg.replace(/\\/g, "/") + "/" : "";
+
+  const includes = [];
+  const excludes = [];
+  for (const p of patterns) {
+    if (p.startsWith("!")) excludes.push(_globToRegExp(p.slice(1)));
+    else includes.push(_globToRegExp(p));
+  }
+  if (includes.length === 0) return lcov;
+
+  let files;
+  try {
+    files = JSON.parse(readFileSync(bazelFilelistJsonPath, "utf8"));
+  } catch (_) {
+    return lcov;
+  }
+  if (!Array.isArray(files)) return lcov;
+
+  let appended = "";
+  for (const wsPath of files) {
+    const norm = String(wsPath).replace(/\\/g, "/");
+    if (presentPaths.has(norm)) continue;
+    if (pkgPrefix && !norm.startsWith(pkgPrefix)) continue;
+    const rel = pkgPrefix ? norm.slice(pkgPrefix.length) : norm;
+    if (!includes.some((re) => re.test(rel))) continue;
+    if (excludes.some((re) => re.test(rel))) continue;
+
+    let text;
+    try {
+      text = readFileSync(_resolveRunfilesPath(norm), "utf8");
+    } catch (_) {
+      continue; // directory entry or unreadable -- skip
+    }
+    const lines = text.split(/\r?\n/);
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const n = lines.length;
+    if (n === 0) continue;
+
+    presentPaths.add(norm);
+    let rec = "SF:" + norm + "\n";
+    for (let i = 1; i <= n; i++) rec += "DA:" + i + ",0\n";
+    rec += "LF:" + n + "\nLH:0\nend_of_record\n";
+    appended += rec;
+  }
+  return appended ? lcov + appended : lcov;
+}
+
 export default async function jestConfig() {
   const config = await _loadUserConfig();
   _verifyJestConfig(config);
@@ -258,6 +367,9 @@ export default async function jestConfig() {
             if (!existsSync(covFilePath)) return;
             const cwd = process.cwd();
             const lcov = readFileSync(covFilePath, "utf8");
+            // Workspace-relative SF paths already present after rewrite -- used
+            // to skip files that already have real coverage when backfilling.
+            const presentPaths = new Set();
             const fixed = lcov.replace(/^SF:(.*)$/gm, (_, sfPath) => {
               // Windows records paths relative to the (bin-tree) rootDir as
               // `..\..\..\lib\app.js`; resolve them to absolute first.
@@ -265,21 +377,26 @@ export default async function jestConfig() {
                 ? sfPath
                 : path.resolve(cwd, sfPath);
               abs = abs.replace(/\\/g, "/");
+              let ws = sfPath;
               // runfiles tree (Linux, default rootDir).
               const r = abs.lastIndexOf(runfilesMarker);
               if (r >= 0) {
-                return "SF:" + abs.slice(r + runfilesMarker.length);
-              }
-              // bazel-out/<config>/bin/ tree (Windows, V8 follows the symlink).
-              if (binSuffix) {
+                ws = abs.slice(r + runfilesMarker.length);
+              } else if (binSuffix) {
+                // bazel-out/<config>/bin/ tree (Windows, V8 follows the symlink).
                 const b = abs.lastIndexOf(binSuffix);
-                if (b >= 0) {
-                  return "SF:" + abs.slice(b + binSuffix.length);
-                }
+                if (b >= 0) ws = abs.slice(b + binSuffix.length);
               }
-              return "SF:" + sfPath;
+              presentPaths.add(ws.replace(/\\/g, "/"));
+              return "SF:" + ws;
             });
-            writeFileSync(covFilePath, fixed);
+            // Backfill never-loaded source files at 0% (see _appendUntestedFiles).
+            const withUntested = _appendUntestedFiles(
+              fixed,
+              config,
+              presentPaths,
+            );
+            writeFileSync(covFilePath, withUntested);
           } catch (_) {
             // Best-effort rewrite; coverage still works without it
           }
