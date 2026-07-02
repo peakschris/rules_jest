@@ -171,64 +171,45 @@ export default async function jestConfig() {
 
   if (coverageEnabled) {
     config.collectCoverage = true;
-    config.coverageProvider = "v8";
 
-    // TEMP DIAGNOSTIC (remove once the Linux realpath layout is confirmed).
-    // The v8 coverage gate in jest-runtime is `res.url.startsWith(config.rootDir)`
-    // where res.url is the *realpath* of each loaded module. To design a Linux-safe
-    // rootDir repoint we need to know where source files actually resolve to.
-    // Log the runfiles path and realpath of the user's jest.config.js (colocated
-    // with the source files under test), plus the wrapper config's own realpath.
-    try {
-      const _diag = {
-        platform: process.platform,
-        userRootDir: config.rootDir ?? null,
-        cwd: process.cwd(),
-        cfgUrl: fileURLToPath(import.meta.url),
-        cfgReal: realpathSync(fileURLToPath(import.meta.url)),
-        bindir: process.env.JS_BINARY__BINDIR ?? null,
-        workspace: process.env.JS_BINARY__WORKSPACE ?? null,
-      };
-      if (userConfigShortPath) {
-        _diag.ucpRunfiles = _resolveRunfilesPath(userConfigShortPath);
-        try {
-          _diag.ucpReal = realpathSync(_diag.ucpRunfiles);
-        } catch (e) {
-          _diag.ucpReal = "ERR:" + (e && e.code);
-        }
-      }
-      console.error("COVERAGE-DIAG " + JSON.stringify(_diag));
-    } catch (e) {
-      console.error("COVERAGE-DIAG error: " + ((e && e.stack) || e));
-    }
-
-    // V8 records coverage URLs by realpath: Node resolves the runfiles symlink,
-    // so every URL lands under the execroot bin tree (bazel-out/<cfg>/bin/...).
-    // Jest, however, derives rootDir from the --config path Bazel passes, which
-    // is the runfiles/sandbox tree on Linux (and the bin tree on Windows).
-    // jest-runtime's coverage filter keeps a V8 entry only when
+    // Coverage provider is left to the user's jest config. Jest defaults to
+    // "babel", which instruments every collectCoverageFrom match via
+    // babel-plugin-istanbul -- so files no test loads still report at 0%.
+    //
+    // The rootDir/roots repoint below is a v8-ONLY workaround, so it is gated on
+    // the effective provider. v8 records coverage URLs by realpath: Node
+    // resolves the runfiles symlink, so every URL lands under the execroot bin
+    // tree (bazel-out/<cfg>/bin/...). Jest, however, derives rootDir from the
+    // --config path Bazel passes, which is the runfiles/sandbox tree on Linux
+    // (and the bin tree on Windows). jest-runtime's coverage filter keeps a v8
+    // entry only when
     //   res.url.startsWith(config.rootDir)  AND  shouldInstrument(res.url,...)
     // (the latter matches path.relative(rootDir, res.url) against
-    // collectCoverageFrom) -- BOTH fail when rootDir is the runfiles tree but the
-    // URL is the bin realpath, so all coverage is dropped and Jest emits empty
-    // reports. Repoint rootDir at the realpath'd bin directory (where the V8 URLs
-    // actually are) on every platform so both checks pass.
+    // collectCoverageFrom) -- BOTH fail when rootDir is the runfiles tree but
+    // the URL is the bin realpath, so all coverage is dropped and Jest emits
+    // empty reports. Repoint rootDir at the realpath'd bin directory (where the
+    // v8 URLs actually are) so both checks pass; repointing can move rootDir
+    // away from where Bazel staged the test files (that earlier caused "No
+    // tests found" on Linux), so point `roots` back at the runfiles source
+    // directory to keep discovery working.
     //
-    // Repointing rootDir can move it away from where Bazel staged the test files
-    // (that earlier caused "No tests found" on Linux). Keep discovery working by
-    // pointing `roots` back at the runfiles source directory Bazel populated,
-    // derived from the user config's runfiles path.
-    try {
-      config.rootDir = path.dirname(
-        realpathSync(fileURLToPath(import.meta.url)),
-      );
-      if (userConfigShortPath) {
-        config.roots = [
-          path.dirname(_resolveRunfilesPath(userConfigShortPath)),
-        ];
+    // Under babel this must NOT run: istanbul instruments during transform (no
+    // realpath gate), and jest's native rootDir (= the runfiles src dir that
+    // holds lib/) is required so collectCoverageFrom enumeration and the
+    // _addUntestedFiles 0% backfill line up on the same tree.
+    if ((config.coverageProvider || "babel") === "v8") {
+      try {
+        config.rootDir = path.dirname(
+          realpathSync(fileURLToPath(import.meta.url)),
+        );
+        if (userConfigShortPath) {
+          config.roots = [
+            path.dirname(_resolveRunfilesPath(userConfigShortPath)),
+          ];
+        }
+      } catch (_) {
+        // Fall back to default rootDir if symlink resolution fails
       }
-    } catch (_) {
-      // Fall back to default rootDir if symlink resolution fails
     }
 
     let coverageFile = path.basename(process.env.COVERAGE_OUTPUT_FILE);
