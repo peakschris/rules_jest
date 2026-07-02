@@ -280,42 +280,43 @@ export default async function jestConfig() {
 
   if (coverageEnabled) {
     config.collectCoverage = true;
-    // Leave `coverageProvider` unset so jest's default (babel/istanbul) is used.
-    // babel-jest is already jest's transformer here, so enabling coverage just
-    // makes it additionally inject babel-plugin-istanbul, instrumenting every
-    // collectCoverageFrom match at transform time. That lists never-loaded source
-    // files at an honest 0% (real executable-line/branch/function denominators),
-    // unlike v8 which only records scripts actually executed. The service configs
-    // set no coverageProvider, so the default wins.
+    config.coverageProvider = "v8";
+
+    // NOTE: the babel/istanbul provider was tried here (to list never-loaded
+    // files at 0%) and does NOT work under this rules_js layout. The source
+    // files are runfiles symlinks that Node realpaths into the execroot bin
+    // tree, so jest's babel `shouldInstrument` -- which matches the realpath'd
+    // bin path against collectCoverageFrom RELATIVE TO rootDir -- fails the same
+    // way the v8 gate does, yielding 0% for every file. Keeping v8.
     //
-    // rules_js stages sources as REAL files in the execroot bin output tree
-    // (bazel-out/<cfg>/bin/src/<svc>/lib/*.js) and exposes them to the test
-    // through a runfiles symlink tree. jest-resolve realpaths required modules, so
-    // loaded source files resolve to their BIN-tree path. Two coverage gates must
-    // line up with that bin-tree path or babel/istanbul silently produces nothing:
-    //
-    //  1. shouldInstrument matches
-    //       replacePathSepForGlob(path.relative(config.rootDir, <file>))
-    //     against collectCoverageFrom. For that to yield `lib/x.js` (matching
-    //     `lib/**/*.js`), rootDir must be the bin-tree `src/<svc>` dir that
-    //     directly contains `lib/`. import.meta.url is this generated config,
-    //     loaded through the runfiles symlink; realpathSync resolves it into the
-    //     bin tree, so its dirname is exactly that directory. (With the wrong
-    //     rootDir the instrument flag is never set -> uninstrumented sources.)
-    //
-    //  2. babel-jest hands babel-plugin-istanbul `{ cwd: transformOptions.config.cwd }`
-    //     and "files outside cwd will not be instrumented". jest forces
-    //     ProjectConfig.cwd to process.cwd() (the runfiles dir) and ignores any
-    //     `config.cwd` we set, so the bin-tree files fall outside cwd and istanbul
-    //     drops them -- instrument flag on, but zero counters emitted. chdir into
-    //     the bin src dir is the only lever that moves ProjectConfig.cwd, so do
-    //     that here. Only reached on coverage runs (not plain `bazel test`).
-    try {
-      config.rootDir = path.dirname(realpathSync(fileURLToPath(import.meta.url)));
-      config.roots = [config.rootDir];
-      process.chdir(config.rootDir);
-    } catch (_) {
-      // Fall back to default rootDir/cwd if symlink resolution fails.
+    // v8 records coverage URLs by realpath: Node resolves the runfiles symlink,
+    // so every URL lands under the execroot bin tree (bazel-out/<cfg>/bin/...).
+    // Jest, however, derives rootDir from the --config path Bazel passes, which
+    // is the runfiles/sandbox tree on Linux (and the bin tree on Windows).
+    // jest-runtime's coverage filter keeps a v8 entry only when
+    //   res.url.startsWith(config.rootDir)  AND  shouldInstrument(res.url,...)
+    // (the latter matches path.relative(rootDir, res.url) against
+    // collectCoverageFrom) -- BOTH fail when rootDir is the runfiles tree but
+    // the URL is the bin realpath, so all coverage is dropped and Jest emits
+    // empty reports. Repoint rootDir at the realpath'd bin directory (where the
+    // v8 URLs actually are) so both checks pass; repointing can move rootDir
+    // away from where Bazel staged the test files (that earlier caused "No
+    // tests found" on Linux), so point `roots` back at the runfiles source
+    // directory to keep discovery working. The gate below is kept for clarity;
+    // it always runs given the hard v8 setting above.
+    if ((config.coverageProvider || "babel") === "v8") {
+      try {
+        config.rootDir = path.dirname(
+          realpathSync(fileURLToPath(import.meta.url)),
+        );
+        if (userConfigShortPath) {
+          config.roots = [
+            path.dirname(_resolveRunfilesPath(userConfigShortPath)),
+          ];
+        }
+      } catch (_) {
+        // Fall back to default rootDir if symlink resolution fails
+      }
     }
 
     let coverageFile = path.basename(process.env.COVERAGE_OUTPUT_FILE);
