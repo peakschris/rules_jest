@@ -173,20 +173,20 @@ export default async function jestConfig() {
     config.collectCoverage = true;
     config.coverageProvider = "v8";
 
-    // On Windows, V8 resolves symlinks before recording coverage so paths end
-    // up in bazel-out/<config>/bin/... while the default rootDir is in the
+    // V8 resolves module symlinks before recording coverage, so recorded paths
+    // land in bazel-out/<config>/bin/... while Jest's default rootDir is in the
     // runfiles tree. Point rootDir at the resolved bin directory so V8 coverage
-    // can match source files.
+    // can match source files. This applies on every platform: node resolves the
+    // symlink to the bin tree with preserve_symlinks=false (the default), so
+    // Linux needs the same rootDir fixup as Windows, not just win32.
     let binRoot;
-    if (process.platform === "win32") {
-      try {
-        binRoot = path.dirname(
-          realpathSync(fileURLToPath(import.meta.url)),
-        );
-        config.rootDir = binRoot;
-      } catch (_) {
-        // Fall back to default rootDir if symlink resolution fails
-      }
+    try {
+      binRoot = path.dirname(
+        realpathSync(fileURLToPath(import.meta.url)),
+      );
+      config.rootDir = binRoot;
+    } catch (_) {
+      // Fall back to default rootDir if symlink resolution fails
     }
 
     let coverageFile = path.basename(process.env.COVERAGE_OUTPUT_FILE);
@@ -207,10 +207,10 @@ export default async function jestConfig() {
       config.coverageReporters = ["text", ["lcovonly", { file: coverageFile }]];
 
       // Bazel's coverage merger expects SF paths to be workspace-relative
-      // (e.g. src/cfgsvc/lib/app.js). On Windows with coverageProvider v8,
-      // paths are relative to cwd (the runfiles dir) and resolve into the
-      // bazel-out bin tree. Rewrite them to workspace-relative short paths
-      // after Jest finishes.
+      // (e.g. src/cfgsvc/lib/app.js). With coverageProvider v8 the recorded
+      // paths are absolute (or relative to cwd, the runfiles dir) and resolve
+      // into the bazel-out bin tree on every platform. Rewrite them to
+      // workspace-relative short paths after Jest finishes.
       if (binRoot && !process._jestCoverageRewriteRegistered) {
         process._jestCoverageRewriteRegistered = true;
         const covFilePath = path.join(coverageDirectory, coverageFile);
