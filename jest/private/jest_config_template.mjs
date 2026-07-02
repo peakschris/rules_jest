@@ -225,33 +225,40 @@ export default async function jestConfig() {
         const binSuffix = bindir
           ? "/" + bindir.replace(/\\/g, "/") + "/"
           : null;
-        // e.g. <...>/test.runfiles/_main/ -> strip to leave src/<svc>/...
-        const runfiles = process.env.JS_BINARY__RUNFILES;
-        const workspace = process.env.JS_BINARY__WORKSPACE;
-        const runfilesRoot =
-          runfiles && workspace
-            ? runfiles.replace(/\\/g, "/").replace(/\/$/, "") + "/" + workspace + "/"
-            : null;
+        // Runfiles-tree marker, e.g. `.runfiles/_main/`. On Linux the recorded
+        // SF path runs through the runfiles tree
+        //   src/node-mgr/test_/test.runfiles/_main/src/node-mgr/lib/cli.js
+        // and resolving it below against a cwd that itself sits under the
+        // runfiles root doubles the prefix -- so match with lastIndexOf (strip
+        // to the innermost/source copy), NOT startsWith. This marker must be
+        // tried BEFORE binSuffix: the runfiles tree lives under
+        // bazel-out/<cfg>/bin/, so a bin-tree strip would fire first and leave
+        // the nested `.../test.runfiles/_main/src/...` prefix in place.
+        const workspace = process.env.JS_BINARY__WORKSPACE || "_main";
+        const runfilesMarker = ".runfiles/" + workspace + "/";
         process.on("exit", () => {
           try {
             if (!existsSync(covFilePath)) return;
             const cwd = process.cwd();
             const lcov = readFileSync(covFilePath, "utf8");
             const fixed = lcov.replace(/^SF:(.*)$/gm, (_, sfPath) => {
+              // Windows records paths relative to the (bin-tree) rootDir as
+              // `..\..\..\lib\app.js`; resolve them to absolute first.
               let abs = path.isAbsolute(sfPath)
                 ? sfPath
                 : path.resolve(cwd, sfPath);
               abs = abs.replace(/\\/g, "/");
-              // bazel-out/<config>/bin/ tree (Windows, or Linux realpath'd).
-              if (binSuffix) {
-                const idx = abs.indexOf(binSuffix);
-                if (idx >= 0) {
-                  return "SF:" + abs.slice(idx + binSuffix.length);
-                }
-              }
               // runfiles tree (Linux, default rootDir).
-              if (runfilesRoot && abs.startsWith(runfilesRoot)) {
-                return "SF:" + abs.slice(runfilesRoot.length);
+              const r = abs.lastIndexOf(runfilesMarker);
+              if (r >= 0) {
+                return "SF:" + abs.slice(r + runfilesMarker.length);
+              }
+              // bazel-out/<config>/bin/ tree (Windows, V8 follows the symlink).
+              if (binSuffix) {
+                const b = abs.lastIndexOf(binSuffix);
+                if (b >= 0) {
+                  return "SF:" + abs.slice(b + binSuffix.length);
+                }
               }
               return "SF:" + sfPath;
             });
