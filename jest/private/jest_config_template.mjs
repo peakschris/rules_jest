@@ -173,6 +173,35 @@ export default async function jestConfig() {
     config.collectCoverage = true;
     config.coverageProvider = "v8";
 
+    // TEMP DIAGNOSTIC (remove once the Linux realpath layout is confirmed).
+    // The v8 coverage gate in jest-runtime is `res.url.startsWith(config.rootDir)`
+    // where res.url is the *realpath* of each loaded module. To design a Linux-safe
+    // rootDir repoint we need to know where source files actually resolve to.
+    // Log the runfiles path and realpath of the user's jest.config.js (colocated
+    // with the source files under test), plus the wrapper config's own realpath.
+    try {
+      const _diag = {
+        platform: process.platform,
+        userRootDir: config.rootDir ?? null,
+        cwd: process.cwd(),
+        cfgUrl: fileURLToPath(import.meta.url),
+        cfgReal: realpathSync(fileURLToPath(import.meta.url)),
+        bindir: process.env.JS_BINARY__BINDIR ?? null,
+        workspace: process.env.JS_BINARY__WORKSPACE ?? null,
+      };
+      if (userConfigShortPath) {
+        _diag.ucpRunfiles = _resolveRunfilesPath(userConfigShortPath);
+        try {
+          _diag.ucpReal = realpathSync(_diag.ucpRunfiles);
+        } catch (e) {
+          _diag.ucpReal = "ERR:" + (e && e.code);
+        }
+      }
+      console.error("COVERAGE-DIAG " + JSON.stringify(_diag));
+    } catch (e) {
+      console.error("COVERAGE-DIAG error: " + ((e && e.stack) || e));
+    }
+
     // On Windows, V8 resolves symlinks before recording coverage so paths end
     // up in bazel-out/<config>/bin/... while the default rootDir is in the
     // runfiles tree. Point rootDir at the resolved bin directory so V8 coverage
