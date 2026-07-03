@@ -38,6 +38,10 @@ _attrs = dicts.add(js_binary_lib.attrs, {
         allow_single_file = True,
         default = Label("//jest/private:jest_config_template.mjs"),
     ),
+    "_coverage_preload": attr.label(
+        allow_single_file = True,
+        default = Label("//jest/private:coverage_preload.cjs"),
+    ),
     # Earlier versions of Bazel expect this attribute to be present.
     # https://github.com/bazelbuild/bazel/issues/13978
     # We use a no-op because jest itself generates the coverage.
@@ -116,6 +120,15 @@ def _impl(ctx):
     if ctx.attr.run_in_band:
         fixed_args.append("--runInBand")
 
+    # Under coverage, preload a small bootstrap that chdirs into the bin package
+    # so istanbul (which only instruments files under realpath(process.cwd()))
+    # sees the source files. See coverage_preload.cjs for the full rationale.
+    if ctx.configuration.coverage_enabled:
+        fixed_args.append("--node_options=--require=%s" % paths.join(
+            unwind_chdir_prefix,
+            ctx.file._coverage_preload.short_path,
+        ))
+
     fixed_env = {}
     if ctx.attr.update_snapshots:
         fixed_args.append("--updateSnapshot")
@@ -148,6 +161,8 @@ def _impl(ctx):
     files.append(ctx.file.bazel_snapshot_resolver)
     files.append(ctx.file.bazel_haste_map_module)
     files.append(filelist)
+    if ctx.configuration.coverage_enabled:
+        files.append(ctx.file._coverage_preload)
 
     runfiles = ctx.runfiles(
         files = files,

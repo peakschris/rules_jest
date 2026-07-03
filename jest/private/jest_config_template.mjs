@@ -11,7 +11,6 @@
  * module scope; everything that mutates the config object lives inside the factory.
  */
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "fs";
-import { fileURLToPath } from "url";
 import * as path from "path";
 
 const updateSnapshots = !!process.env.JEST_TEST__UPDATE_SNAPSHOTS;
@@ -109,6 +108,11 @@ function _addReporter(config, name, reporter = name) {
  * micromatch (`**`, `**​/`, `*`, `?`) sufficient for the conventional coverage
  * globs (e.g. `lib/**​/*.js`, `!lib/**​/*.test.js`). Only used by the exit-time
  * 0%-backfill below; NOT a general micromatch replacement.
+ *
+ * micromatch (jest's own glob engine) is deliberately NOT reused here: under
+ * rules_js's strict pnpm layout it is a transitive dep of jest and is not
+ * resolvable from this generated config's location (`import("micromatch")`
+ * throws ERR_MODULE_NOT_FOUND), so a dependency-free matcher is required.
  */
 function _globToRegExp(glob) {
   let re = "";
@@ -143,20 +147,23 @@ function _globToRegExp(glob) {
  * Append synthetic 0%-coverage LCOV records for source files that match
  * `collectCoverageFrom` but were never loaded by any test.
  *
- * WHY: jest's v8 coverage provider only records files actually executed, and its
- * `_addUntestedFiles` 0%-backfill enumerates `collectCoverageFrom` relative to
- * `rootDir` -- which the v8 fix repoints at the bin tree while the haste FS comes
- * from the runfiles tree, so the globs never match and untested files are simply
- * absent from the report (making overall coverage read optimistically). The
- * runfiles/bin/haste-map split makes this irreconcilable via `rootDir` alone, so
- * we backfill here at exit instead, independent of jest's own enumeration.
+ * WHY (and why not jest's own backfill): jest records coverage only for files a
+ * test actually loads. Its native 0%-backfill (`_addUntestedFiles`) enumerates
+ * `collectCoverageFrom` against the haste FS relative to `rootDir` -- but the two
+ * cannot be aligned here. `rootDir` must be the bin package (so `shouldInstrument`
+ * matches loaded files -- see the coverage block below), while the haste FS is
+ * built from `roots` = the runfiles package (so tests are discovered via
+ * bazel_haste_map.cjs). With `rootDir` and the haste files in different trees the
+ * native glob never matches, so untested files are silently absent and coverage
+ * reads optimistically. Repointing either one to fix the backfill breaks the
+ * other, so we backfill here at exit instead, independent of jest's enumeration.
  *
  * Enumeration source is the Bazel filelist (`test__jest.files.json`: an array of
  * workspace-relative data paths), filtered by the package-relative
  * `collectCoverageFrom` globs (`JS_BINARY__PACKAGE` is stripped to make filelist
  * entries package-relative). Line counts come from the runfiles copy of each
  * file. Emits `DA:n,0` for every physical line + `LF`/`LH:0`, matching the shape
- * v8/lcovonly produces for covered files (a DA entry per line). `presentPaths`
+ * lcovonly produces for covered files (a DA entry per line). `presentPaths`
  * (workspace-relative SF paths already in the report) are skipped. Best-effort:
  * any failure returns the report unchanged.
  */
@@ -280,43 +287,31 @@ export default async function jestConfig() {
 
   if (coverageEnabled) {
     config.collectCoverage = true;
-    config.coverageProvider = "v8";
+    config.coverageProvider = "babel";
 
-    // NOTE: the babel/istanbul provider was tried here (to list never-loaded
-    // files at 0%) and does NOT work under this rules_js layout. The source
-    // files are runfiles symlinks that Node realpaths into the execroot bin
-    // tree, so jest's babel `shouldInstrument` -- which matches the realpath'd
-    // bin path against collectCoverageFrom RELATIVE TO rootDir -- fails the same
-    // way the v8 gate does, yielding 0% for every file. Keeping v8.
-    //
-    // v8 records coverage URLs by realpath: Node resolves the runfiles symlink,
-    // so every URL lands under the execroot bin tree (bazel-out/<cfg>/bin/...).
-    // Jest, however, derives rootDir from the --config path Bazel passes, which
-    // is the runfiles/sandbox tree on Linux (and the bin tree on Windows).
-    // jest-runtime's coverage filter keeps a v8 entry only when
-    //   res.url.startsWith(config.rootDir)  AND  shouldInstrument(res.url,...)
-    // (the latter matches path.relative(rootDir, res.url) against
-    // collectCoverageFrom) -- BOTH fail when rootDir is the runfiles tree but
-    // the URL is the bin realpath, so all coverage is dropped and Jest emits
-    // empty reports. Repoint rootDir at the realpath'd bin directory (where the
-    // v8 URLs actually are) so both checks pass; repointing can move rootDir
-    // away from where Bazel staged the test files (that earlier caused "No
-    // tests found" on Linux), so point `roots` back at the runfiles source
-    // directory to keep discovery working. The gate below is kept for clarity;
-    // it always runs given the hard v8 setting above.
-    if ((config.coverageProvider || "babel") === "v8") {
-      try {
-        config.rootDir = path.dirname(
-          realpathSync(fileURLToPath(import.meta.url)),
-        );
-        if (userConfigShortPath) {
-          config.roots = [
-            path.dirname(_resolveRunfilesPath(userConfigShortPath)),
-          ];
-        }
-      } catch (_) {
-        // Fall back to default rootDir if symlink resolution fails
-      }
+    // Align rootDir/roots with how the babel (istanbul) provider sees files
+    // under rules_js. Node realpaths every required module, so the filename
+    // jest's `shouldInstrument` receives is the *bin-tree* path, not the
+    // runfiles path. `shouldInstrument` keeps a file only when
+    // path.relative(rootDir, file) matches collectCoverageFrom, so rootDir must
+    // be the real bin package dir for `lib/x.js` to match `lib/**`. Test
+    // *discovery*, however, goes through the bazel haste map
+    // (bazel_haste_map.cjs), which registers every file at its runfiles path --
+    // so `roots` stays on the runfiles package dir. (coverage_preload.cjs
+    // additionally chdirs into the bin package so istanbul's cwd gate passes;
+    // see that file for the full rationale.)
+    try {
+      const rfPkg = path.join(
+        process.env.TEST_SRCDIR,
+        process.env.TEST_WORKSPACE,
+        process.env.JS_BINARY__PACKAGE || "",
+      );
+      const binPkg = path.dirname(realpathSync(config.haste.hasteMapModulePath));
+      config.rootDir = binPkg;
+      config.roots = [rfPkg];
+    } catch (e) {
+      // Best-effort: fall back to jest's defaults if the bin path can't be
+      // resolved (coverage may be empty, but the test still runs).
     }
 
     let coverageFile = path.basename(process.env.COVERAGE_OUTPUT_FILE);
@@ -337,13 +332,11 @@ export default async function jestConfig() {
       config.coverageReporters = ["text", ["lcovonly", { file: coverageFile }]];
 
       // Bazel's coverage merger expects SF paths to be workspace-relative
-      // (e.g. src/cfgsvc/lib/app.js). With coverageProvider v8 the recorded
-      // paths are absolute (or relative to cwd). Depending on platform they
-      // resolve either into the bazel-out bin tree (Windows, where V8 follows
-      // the symlink) or into the runfiles tree (Linux, default rootDir).
-      // Rewrite both forms to workspace-relative short paths after Jest
-      // finishes; runs on every platform (a best-effort, exit-time file
-      // rewrite that cannot affect test execution).
+      // (e.g. src/cfgsvc/lib/app.js). istanbul records each SF relative to
+      // rootDir (the bin package). Resolve against cwd (coverage_preload.cjs has
+      // chdir'd it to the same bin package) to an absolute bin-tree path, then
+      // strip up to and including the bin dir to recover the workspace-relative
+      // path. Best-effort, exit-time rewrite that cannot affect test execution.
       if (!process._jestCoverageRewriteRegistered) {
         process._jestCoverageRewriteRegistered = true;
         const covFilePath = path.join(coverageDirectory, coverageFile);
@@ -351,17 +344,6 @@ export default async function jestConfig() {
         const binSuffix = bindir
           ? "/" + bindir.replace(/\\/g, "/") + "/"
           : null;
-        // Runfiles-tree marker, e.g. `.runfiles/_main/`. On Linux the recorded
-        // SF path runs through the runfiles tree
-        //   src/node-mgr/test_/test.runfiles/_main/src/node-mgr/lib/cli.js
-        // and resolving it below against a cwd that itself sits under the
-        // runfiles root doubles the prefix -- so match with lastIndexOf (strip
-        // to the innermost/source copy), NOT startsWith. This marker must be
-        // tried BEFORE binSuffix: the runfiles tree lives under
-        // bazel-out/<cfg>/bin/, so a bin-tree strip would fire first and leave
-        // the nested `.../test.runfiles/_main/src/...` prefix in place.
-        const workspace = process.env.JS_BINARY__WORKSPACE || "_main";
-        const runfilesMarker = ".runfiles/" + workspace + "/";
         process.on("exit", () => {
           try {
             if (!existsSync(covFilePath)) return;
@@ -371,23 +353,16 @@ export default async function jestConfig() {
             // to skip files that already have real coverage when backfilling.
             const presentPaths = new Set();
             const fixed = lcov.replace(/^SF:(.*)$/gm, (_, sfPath) => {
-              // Windows records paths relative to the (bin-tree) rootDir as
-              // `..\..\..\lib\app.js`; resolve them to absolute first.
-              let abs = path.isAbsolute(sfPath)
+              const abs = (path.isAbsolute(sfPath)
                 ? sfPath
-                : path.resolve(cwd, sfPath);
-              abs = abs.replace(/\\/g, "/");
-              let ws = sfPath;
-              // runfiles tree (Linux, default rootDir).
-              const r = abs.lastIndexOf(runfilesMarker);
-              if (r >= 0) {
-                ws = abs.slice(r + runfilesMarker.length);
-              } else if (binSuffix) {
-                // bazel-out/<config>/bin/ tree (Windows, V8 follows the symlink).
+                : path.resolve(cwd, sfPath)
+              ).replace(/\\/g, "/");
+              let ws = sfPath.replace(/\\/g, "/");
+              if (binSuffix) {
                 const b = abs.lastIndexOf(binSuffix);
                 if (b >= 0) ws = abs.slice(b + binSuffix.length);
               }
-              presentPaths.add(ws.replace(/\\/g, "/"));
+              presentPaths.add(ws);
               return "SF:" + ws;
             });
             // Backfill never-loaded source files at 0% (see _appendUntestedFiles).
