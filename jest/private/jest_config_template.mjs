@@ -11,6 +11,7 @@
  * module scope; everything that mutates the config object lives inside the factory.
  */
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "fs";
+import { createRequire } from "module";
 import * as path from "path";
 
 const updateSnapshots = !!process.env.JEST_TEST__UPDATE_SNAPSHOTS;
@@ -144,6 +145,78 @@ function _globToRegExp(glob) {
 }
 
 /**
+ * Lazily load istanbul's instrumenter and return a single reusable instance
+ * (or null if it can't be loaded). Cached across calls: `undefined` = not yet
+ * tried, `null` = tried and failed.
+ *
+ * WHY the dep walk: the babel coverage provider records functions via
+ * `istanbul-lib-instrument`, so we reuse that exact instrumenter to count
+ * functions in never-loaded files -- keeping the FN denominator methodology
+ * identical to loaded files. But it is not a direct dependency of this
+ * generated config, and rules_js's strict pnpm layout means a bare
+ * `require("istanbul-lib-instrument")` throws ERR_MODULE_NOT_FOUND (the same
+ * constraint that rules out micromatch above). It IS reachable transitively
+ * through jest's dep chain, so we hop `createRequire.resolve` package-by-package
+ * to its absolute path and then require it. `require` (not `import()`) is
+ * mandatory: the only caller runs inside a synchronous process 'exit' handler
+ * where awaiting a dynamic import is impossible -- and istanbul-lib-instrument
+ * is CommonJS, so a synchronous require loads it cleanly.
+ */
+let _instrumenter; // undefined = untried, null = unavailable, else instance
+function _getInstrumenter() {
+  if (_instrumenter !== undefined) return _instrumenter;
+  _instrumenter = null;
+  try {
+    let cur = import.meta.url;
+    for (const spec of [
+      "jest-cli",
+      "@jest/core",
+      "@jest/reporters",
+      "istanbul-lib-instrument",
+    ]) {
+      cur = createRequire(cur).resolve(spec);
+    }
+    const { createInstrumenter } = createRequire(import.meta.url)(cur);
+    _instrumenter = createInstrumenter({
+      coverageVariable: "__coverage__",
+      esModules: false,
+      autoWrap: true,
+      produceSourceMap: false,
+    });
+  } catch (_) {
+    _instrumenter = null; // best-effort: fall back to line-only backfill
+  }
+  return _instrumenter;
+}
+
+/**
+ * Build the LCOV function section (`FN`/`FNF`/`FNH`/`FNDA`) for a never-loaded
+ * file, all at 0 hits, by instrumenting its source with istanbul and reading the
+ * resulting `fnMap`. Emitted in istanbul lcovonly's own order (all `FN:` lines,
+ * then `FNF`/`FNH`, then all `FNDA:` lines) and using `decl.start.line`, so
+ * backfilled files carry the same function shape lcovonly produces for covered
+ * files. Returns "" if the instrumenter is unavailable, the source has no
+ * functions, or instrumentation throws (e.g. a parse error) -- the caller then
+ * falls back to line-only backfill.
+ */
+function _functionRecords(text, filename) {
+  const inst = _getInstrumenter();
+  if (!inst) return "";
+  try {
+    inst.instrumentSync(text, filename);
+    const fns = Object.values(inst.lastFileCoverage().fnMap);
+    if (fns.length === 0) return "";
+    let out = "";
+    for (const f of fns) out += "FN:" + f.decl.start.line + "," + f.name + "\n";
+    out += "FNF:" + fns.length + "\nFNH:0\n";
+    for (const f of fns) out += "FNDA:0," + f.name + "\n";
+    return out;
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
  * Append synthetic 0%-coverage LCOV records for source files that match
  * `collectCoverageFrom` but were never loaded by any test.
  *
@@ -162,7 +235,8 @@ function _globToRegExp(glob) {
  * workspace-relative data paths), filtered by the package-relative
  * `collectCoverageFrom` globs (`JS_BINARY__PACKAGE` is stripped to make filelist
  * entries package-relative). Line counts come from the runfiles copy of each
- * file. Emits `DA:n,0` for every physical line + `LF`/`LH:0`, matching the shape
+ * file. Emits istanbul-derived function records (`FN`/`FNF`/`FNH`/`FNDA`) at 0%
+ * then `DA:n,0` for every physical line + `LF`/`LH:0`, matching the shape
  * lcovonly produces for covered files (a DA entry per line). `presentPaths`
  * (workspace-relative SF paths already in the report) are skipped. Best-effort:
  * any failure returns the report unchanged.
@@ -213,6 +287,10 @@ function _appendUntestedFiles(lcov, config, presentPaths) {
 
     presentPaths.add(norm);
     let rec = "SF:" + norm + "\n";
+    // Function records (0% hit) so untested files count toward the FN
+    // denominator with the same istanbul methodology as loaded files. Best-
+    // effort: "" when the instrumenter is unavailable or the source won't parse.
+    rec += _functionRecords(text, norm);
     for (let i = 1; i <= n; i++) rec += "DA:" + i + ",0\n";
     rec += "LF:" + n + "\nLH:0\nend_of_record\n";
     appended += rec;
